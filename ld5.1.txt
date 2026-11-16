@@ -1,0 +1,316 @@
+#include <stdint.h>
+
+#define REG(a) (*(volatile uint32_t *)(a))
+#define RCC_AHBENR REG(0x40021014U)
+#define RCC_APB1ENR REG(0x4002101CU)
+#define RCC_APB2ENR REG(0x40021018U)
+#define GPIOA_MODER REG(0x48000000U)
+#define GPIOA_PUPDR REG(0x4800000CU)
+#define GPIOB_MODER REG(0x48000400U)
+#define GPIOB_OTYPER REG(0x48000404U)
+#define GPIOB_PUPDR REG(0x4800040CU)
+#define GPIOB_AFRL REG(0x48000420U)
+#define GPIOD_MODER REG(0x48000C00U)
+#define GPIOD_AFRH REG(0x48000C24U)
+#define GPIOE_MODER REG(0x48001000U)
+#define GPIOE_BSRR REG(0x48001018U)
+#define SYSCFG_EXTICR1 REG(0x40010008U)
+#define EXTI_IMR REG(0x40010400U)
+#define EXTI_RTSR REG(0x40010408U)
+#define EXTI_FTSR REG(0x4001040CU)
+#define EXTI_PR REG(0x40010414U)
+#define NVIC_ISER0 REG(0xE000E100U)
+#define I2C1_CR1 REG(0x40005400U)
+#define I2C1_CR2 REG(0x40005404U)
+#define I2C1_TIMINGR REG(0x40005410U)
+#define I2C1_ISR REG(0x40005418U)
+#define I2C1_ICR REG(0x4000541CU)
+#define I2C1_RXDR REG(0x40005424U)
+#define I2C1_TXDR REG(0x40005428U)
+#define TIM2_CR1 REG(0x40000000U)
+#define TIM2_DIER REG(0x4000000CU)
+#define TIM2_SR REG(0x40000010U)
+#define TIM2_EGR REG(0x40000014U)
+#define TIM2_PSC REG(0x40000028U)
+#define TIM2_ARR REG(0x4000002CU)
+#define TIM3_CR1 REG(0x40000400U)
+#define TIM3_DIER REG(0x4000040CU)
+#define TIM3_SR REG(0x40000410U)
+#define TIM3_EGR REG(0x40000414U)
+#define TIM3_PSC REG(0x40000428U)
+#define TIM3_ARR REG(0x4000042CU)
+#define TIM4_CR1 REG(0x40000800U)
+#define TIM4_EGR REG(0x40000814U)
+#define TIM4_CCMR1 REG(0x40000818U)
+#define TIM4_CCMR2 REG(0x4000081CU)
+#define TIM4_CCER REG(0x40000820U)
+#define TIM4_PSC REG(0x40000828U)
+#define TIM4_ARR REG(0x4000082CU)
+#define TIM4_CCR1 REG(0x40000834U)
+#define TIM4_CCR2 REG(0x40000838U)
+#define TIM4_CCR3 REG(0x4000083CU)
+#define TIM4_CCR4 REG(0x40000840U)
+
+#define DEAD_BAND_DEG 5
+#define DEAD_HYSTERESIS_DEG 2
+#define MODE_HYSTERESIS_DEG 3
+#define FULL_TILT_DEG 45
+#define MAX_STEP_FREQUENCY 60
+#define MAX_ACCELERATION 100
+
+volatile int16_t ax, ay, az;
+volatile int32_t angle_x, angle_y;
+volatile int32_t command_rate, actual_rate_milli;
+volatile uint32_t running, mode, desired_mode, steps, status;
+volatile uint32_t uptime_ms, sensor_samples;
+static volatile uint32_t sensor_due, phase_index = 1, step_accum;
+static volatile uint32_t last_press_ms = (uint32_t)-200;
+
+static int magnitude(int x) { return x < 0 ? -x : x; }
+
+static uint32_t isqrt32(uint32_t x)
+{
+    uint32_t result = 0, bit = 1UL << 30;
+    while (bit > x) bit >>= 2;
+    while (bit) {
+        if (x >= result + bit) {
+            x -= result + bit;
+            result = (result >> 1) + bit;
+        } else result >>= 1;
+        bit >>= 2;
+    }
+    return result;
+}
+
+static int atan2_deg_approx(int y, int x)
+{
+    int ay = magnitude(y), ax = magnitude(x);
+    if (!ay && !ax) return 0;
+    int larger = ay > ax ? ay : ax;
+    int smaller = ay > ax ? ax : ay;
+    int ratio = 1024 * smaller / larger;
+    int angle = (ratio * (45 * 1024 + 16 * (1024 - ratio))
+                 + 524288) / 1048576;
+    if (ay > ax) angle = 90 - angle;
+    if (x < 0) angle = 180 - angle;
+    return y < 0 ? -angle : angle;
+}
+
+static int i2c_wait(uint32_t flag)
+{
+    for (uint32_t i = 0; i < 200000U; i++) {
+        uint32_t s = I2C1_ISR;
+        if (s & ((1U << 4) | (1U << 8) | (1U << 9))) return 0;
+        if (s & flag) return 1;
+    }
+    return 0;
+}
+
+static int i2c_write(uint8_t reg, uint8_t value)
+{
+    I2C1_CR2 = (0x19U << 1) | (2U << 16) | (1U << 25) | (1U << 13);
+    if (!i2c_wait(1U << 1)) return 0;
+    I2C1_TXDR = reg;
+    if (!i2c_wait(1U << 1)) return 0;
+    I2C1_TXDR = value;
+    if (!i2c_wait(1U << 5)) return 0;
+    I2C1_ICR = 1U << 5;
+    return 1;
+}
+
+static int i2c_read(uint8_t reg, uint8_t *data, uint8_t n)
+{
+    I2C1_CR2 = (0x19U << 1) | (1U << 16) | (1U << 13);
+    if (!i2c_wait(1U << 1)) return 0;
+    I2C1_TXDR = reg;
+    if (!i2c_wait(1U << 6)) return 0;
+    I2C1_CR2 = (0x19U << 1) | ((uint32_t)n << 16)
+             | (1U << 10) | (1U << 25) | (1U << 13);
+    for (uint8_t i = 0; i < n; i++) {
+        if (!i2c_wait(1U << 2)) return 0;
+        data[i] = (uint8_t)I2C1_RXDR;
+    }
+    if (!i2c_wait(1U << 5)) return 0;
+    I2C1_ICR = 1U << 5;
+    return 1;
+}
+
+static void motor_off(void)
+{
+    TIM4_CCR1 = TIM4_CCR2 = TIM4_CCR3 = TIM4_CCR4 = 0;
+}
+
+static void motor_step(void)
+{
+    static const int8_t winding[8][2] = {
+        {100, 0}, {70, 70}, {0, 100}, {-70, 70},
+        {-100, 0}, {-70, -70}, {0, -100}, {70, -70}
+    };
+    int a = winding[phase_index][0], b = winding[phase_index][1];
+    TIM4_CCR1 = a > 0 ? (uint32_t)a : 0;
+    TIM4_CCR2 = a < 0 ? (uint32_t)(-a) : 0;
+    TIM4_CCR3 = b > 0 ? (uint32_t)b : 0;
+    TIM4_CCR4 = b < 0 ? (uint32_t)(-b) : 0;
+}
+
+void TIM2_IRQHandler(void)
+{
+    if (!(TIM2_SR & 1U)) return;
+    TIM2_SR = 0;
+    uptime_ms++;
+
+    if (mode != desired_mode && actual_rate_milli == 0) {
+        mode = desired_mode;
+        if (!mode) phase_index |= 1U;
+    }
+
+    int32_t goal = (running && mode == desired_mode) ? command_rate * 1000 : 0;
+    if ((actual_rate_milli > 0 && goal < 0) ||
+        (actual_rate_milli < 0 && goal > 0)) goal = 0;
+
+    if (actual_rate_milli < goal) {
+        actual_rate_milli += MAX_ACCELERATION;
+        if (actual_rate_milli > goal) actual_rate_milli = goal;
+    } else if (actual_rate_milli > goal) {
+        actual_rate_milli -= MAX_ACCELERATION;
+        if (actual_rate_milli < goal) actual_rate_milli = goal;
+    }
+
+    if (!actual_rate_milli) {
+        step_accum = 0;
+        motor_off();
+        return;
+    }
+
+    step_accum += (uint32_t)magnitude(actual_rate_milli);
+    if (step_accum >= 1000000U) {
+        step_accum -= 1000000U;
+        uint32_t increment = mode ? 1U : 2U;
+        phase_index = (phase_index + (actual_rate_milli > 0 ?
+                       increment : 8U - increment)) & 7U;
+        motor_step();
+        steps++;
+    }
+}
+
+void TIM3_IRQHandler(void)
+{
+    if (TIM3_SR & 1U) {
+        TIM3_SR = 0;
+        sensor_due = 1;
+    }
+}
+
+void EXTI0_IRQHandler(void)
+{
+    if (!(EXTI_PR & 1U)) return;
+    EXTI_PR = 1U;
+    if ((uint32_t)(uptime_ms - last_press_ms) >= 150U) {
+        last_press_ms = uptime_ms;
+        running ^= 1U;
+        GPIOE_BSRR = running ? (1U << 9) : (1U << 25);
+    }
+}
+
+static void update_target(void)
+{
+    int x = magnitude(angle_x), y = magnitude(angle_y);
+    if (x > y + MODE_HYSTERESIS_DEG) desired_mode = 1;
+    else if (y > x + MODE_HYSTERESIS_DEG) desired_mode = 0;
+
+    int tilt = desired_mode ? angle_x : angle_y;
+    int abs_tilt = magnitude(tilt);
+    if (abs_tilt <= DEAD_BAND_DEG ||
+       (actual_rate_milli == 0 && abs_tilt < DEAD_BAND_DEG + DEAD_HYSTERESIS_DEG)) {
+        command_rate = 0;
+        return;
+    }
+
+    if (abs_tilt > FULL_TILT_DEG) abs_tilt = FULL_TILT_DEG;
+    int rate = MAX_STEP_FREQUENCY * (abs_tilt - DEAD_BAND_DEG)
+             / (FULL_TILT_DEG - DEAD_BAND_DEG);
+    command_rate = tilt >= 0 ? rate : -rate;
+}
+
+int main(void)
+{
+    uint8_t data[6], id;
+    RCC_AHBENR |= (1U << 17) | (1U << 18) | (1U << 20) | (1U << 21);
+    RCC_APB1ENR |= (1U << 0) | (1U << 1) | (1U << 2) | (1U << 21);
+    RCC_APB2ENR |= 1U;
+    (void)RCC_AHBENR;
+
+    GPIOA_MODER &= ~3U;
+    GPIOA_PUPDR = (GPIOA_PUPDR & ~3U) | 2U;
+    GPIOB_MODER = (GPIOB_MODER & ~((3U << 12) | (3U << 14)))
+                 | (2U << 12) | (2U << 14);
+    GPIOB_OTYPER |= (1U << 6) | (1U << 7);
+    GPIOB_PUPDR = (GPIOB_PUPDR & ~((3U << 12) | (3U << 14)))
+                | (1U << 12) | (1U << 14);
+    GPIOB_AFRL = (GPIOB_AFRL & ~((15U << 24) | (15U << 28)))
+               | (4U << 24) | (4U << 28);
+    GPIOD_MODER = (GPIOD_MODER & ~0xFF000000U) | 0xAA000000U;
+    GPIOD_AFRH = (GPIOD_AFRH & ~0xFFFF0000U) | 0x22220000U;
+    GPIOE_MODER = (GPIOE_MODER & ~(3U << 18)) | (1U << 18);
+    GPIOE_BSRR = 1U << 25;
+
+    I2C1_CR1 = 0;
+    I2C1_TIMINGR = 0x10421317U;
+    I2C1_ICR = (1U << 4) | (1U << 5) | (1U << 8) | (1U << 9);
+    I2C1_CR1 = 1;
+    if (!i2c_read(0x0F, &id, 1) || id != 0x33 ||
+        !i2c_write(0x20, 0x57) || !i2c_write(0x23, 0x08)) {
+        status = 2;
+        while (1) {}
+    }
+
+    TIM4_CR1 = 0;
+    TIM4_PSC = 7;
+    TIM4_ARR = 99;
+    TIM4_CCMR1 = (6U << 4) | (1U << 3) | (6U << 12) | (1U << 11);
+    TIM4_CCMR2 = (6U << 4) | (1U << 3) | (6U << 12) | (1U << 11);
+    TIM4_CCER = (1U << 0) | (1U << 4) | (1U << 8) | (1U << 12);
+    motor_off();
+    TIM4_EGR = 1U;
+    TIM4_CR1 = 1U;
+
+    SYSCFG_EXTICR1 &= ~15U;
+    EXTI_IMR |= 1U;
+    EXTI_RTSR |= 1U;
+    EXTI_FTSR &= ~1U;
+    EXTI_PR = 1U;
+
+    TIM2_CR1 = TIM3_CR1 = 0;
+    TIM2_PSC = 799;
+    TIM2_ARR = 9;
+    TIM3_PSC = 7999;
+    TIM3_ARR = 19;
+    TIM2_EGR = TIM3_EGR = 1U;
+    TIM2_SR = TIM3_SR = 0;
+    TIM2_DIER = TIM3_DIER = 1U;
+    NVIC_ISER0 |= (1U << 6) | (1U << 28) | (1U << 29);
+    TIM2_CR1 = TIM3_CR1 = 1U;
+
+    while (1) {
+        if (!sensor_due) continue;
+        sensor_due = 0;
+        if (!i2c_read(0xA8, data, 6)) {
+            status = 3;
+            command_rate = 0;
+            continue;
+        }
+
+        ax = (int16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8)) / 16;
+        ay = (int16_t)((uint16_t)data[2] | ((uint16_t)data[3] << 8)) / 16;
+        az = (int16_t)((uint16_t)data[4] | ((uint16_t)data[5] << 8)) / 16;
+
+        int roll = atan2_deg_approx(ay, az);
+        uint32_t yz = (uint32_t)((int32_t)ay * ay + (int32_t)az * az);
+        int pitch = atan2_deg_approx(-ax, (int)isqrt32(yz));
+        angle_x = (3 * angle_x + roll) / 4;
+        angle_y = (3 * angle_y + pitch) / 4;
+        update_target();
+        sensor_samples++;
+        status = 1;
+    }
+}
